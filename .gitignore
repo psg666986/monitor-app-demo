@@ -1,9 +1,21 @@
-# 编译产物
+# Binaries
 *.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build output
+/guardian-backend
+
+# Go test binaries
+*.test
+
+# Go coverage files
 *.out
 
-# 依赖缓存（保留 go.sum）
+# Dependency vendor directory
 vendor/
 
-# Claude Code 本地配置
+# Claude Code session files
 .claude/
