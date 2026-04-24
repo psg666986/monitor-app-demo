@@ -1,0 +1,9 @@
+# 编译产物
+*.exe
+*.out
+
+# 依赖缓存（保留 go.sum）
+vendor/
+
+# Claude Code 本地配置
+.claude/
