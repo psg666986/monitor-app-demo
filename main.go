@@ -25,11 +25,12 @@ const (
 
 // Device 设备实体
 type Device struct {
-	UUID      string    `json:"uuid"`
-	Role      Role      `json:"role"`
-	Latitude  float64   `json:"latitude"`
-	Longitude float64   `json:"longitude"`
-	LastSeen  time.Time `json:"last_seen"`
+	UUID       string     `json:"uuid"`
+	Role       Role       `json:"role"`
+	Latitude   float64    `json:"latitude"`
+	Longitude  float64    `json:"longitude"`
+	LastSeen   time.Time  `json:"last_seen"`   // 服务端最后收到数据的时间
+	LastUsedAt *time.Time `json:"last_used_at"` // 被监护者手机最后使用时间（由客户端上报）
 }
 
 // PairingSession 旧式配对会话（保留兼容）
@@ -408,11 +409,98 @@ func pairingStatus(store *Store) gin.HandlerFunc {
 }
 
 // ────────────────────────────────────────────
+// Handlers — 数据同步
+// ────────────────────────────────────────────
+
+// POST /data/update
+// 被监护者调用，上报当前位置与手机最后使用时间
+// Body: { "uuid": "...", "lat": 39.9, "lng": 116.4, "last_used_at": "2006-01-02T15:04:05Z" }
+func dataUpdate(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			UUID       string    `json:"uuid"         binding:"required"`
+			Lat        float64   `json:"lat"          binding:"required"`
+			Lng        float64   `json:"lng"          binding:"required"`
+			LastUsedAt time.Time `json:"last_used_at" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		device, ok := store.GetDevice(req.UUID)
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
+			return
+		}
+		if device.Role != RoleWard {
+			c.JSON(http.StatusForbidden, gin.H{"error": "only ward devices can call this endpoint"})
+			return
+		}
+		if _, bound := store.GetBinding(req.UUID); !bound {
+			c.JSON(http.StatusForbidden, gin.H{"error": "device is not paired"})
+			return
+		}
+
+		device.Latitude = req.Lat
+		device.Longitude = req.Lng
+		device.LastSeen = time.Now()
+		device.LastUsedAt = &req.LastUsedAt
+		store.UpsertDevice(device)
+
+		c.JSON(http.StatusOK, gin.H{"message": "updated"})
+	}
+}
+
+// GET /data/latest?uuid=<guardian_uuid>
+// 监护者调用，获取被监护者最新位置和最后使用时间
+func dataLatest(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		guardianID := c.Query("uuid")
+		if guardianID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "uuid query param is required"})
+			return
+		}
+
+		device, ok := store.GetDevice(guardianID)
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
+			return
+		}
+		if device.Role != RoleGuardian {
+			c.JSON(http.StatusForbidden, gin.H{"error": "only guardian devices can call this endpoint"})
+			return
+		}
+
+		binding, bound := store.GetBinding(guardianID)
+		if !bound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "no pairing found for this guardian"})
+			return
+		}
+
+		ward, ok := store.GetDevice(binding.WardID)
+		if !ok {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "ward device record missing"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"ward_uuid":   ward.UUID,
+			"latitude":    ward.Latitude,
+			"longitude":   ward.Longitude,
+			"last_seen":   ward.LastSeen,
+			"last_used_at": ward.LastUsedAt,
+		})
+	}
+}
+
+// ────────────────────────────────────────────
 // main
 // ────────────────────────────────────────────
 
 func main() {
 	store := NewStore()
+	// gin.Default() 已内置 gin.Logger()（请求日志）和 gin.Recovery()（panic 恢复）
 	r := gin.Default()
 
 	r.GET("/ping", func(c *gin.Context) {
@@ -438,6 +526,12 @@ func main() {
 		pair.POST("/generate", generatePairing(store))
 		pair.POST("/confirm", confirmPairing(store))
 		pair.GET("/status", pairingStatus(store))
+	}
+
+	data := r.Group("/data")
+	{
+		data.POST("/update", dataUpdate(store))
+		data.GET("/latest", dataLatest(store))
 	}
 
 	r.Run(":8080")
