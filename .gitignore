@@ -5,8 +5,9 @@
 *.so
 *.dylib
 
-# Build output
-/guardian-backend
+# Build output (compiled binaries, no extension = Linux)
+/guardian-backend/guardian-backend
+guardian-backend.exe
 
 # Go test binaries
 *.test

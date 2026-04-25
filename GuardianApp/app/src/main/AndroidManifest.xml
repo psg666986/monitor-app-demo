@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ==================== 网络权限 ==================== -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- ==================== 位置权限 ==================== -->
+    <!-- 精确位置（GPS）-->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- 粗略位置（网络/基站）-->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- 后台位置（Android 10+ / API 29+ 必须单独申请）-->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- ==================== 使用情况统计权限 ==================== -->
+    <!--
+        PACKAGE_USAGE_STATS 是 AppOps 特殊权限，不通过 requestPermissions() 申请。
+        需引导用户前往 设置 → 有权查看使用情况的应用 手动开启。
+    -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions"
+        xmlns:tools="http://schemas.android.com/tools" />
+
+    <application
+        android:name=".GuardianApplication"
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!--
+            MainActivity：应用唯一入口，用于权限申请和调试测试。
+            主题在 Activity 级单独设置，覆盖 Application 级主题。
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            WorkManager 默认自动初始化（work-runtime-ktx 2.6+），
+            无需手动声明 WorkManagerInitializer；
+            DataSyncWorker 也无需在此单独声明。
+        -->
+
+    </application>
+
+</manifest>
