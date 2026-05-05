@@ -92,9 +92,9 @@ class DataSyncWorker(
 
         // ── Step 4: 上报数据 ──────────────────────────────────
         return try {
+            // uuid 由服务端从 JWT token 中读取，无需在 body 中传递
             ApiClient.api.updateData(
                 DataUpdateRequest(
-                    uuid       = uuid,
                     lat        = latitude,
                     lng        = longitude,
                     lastUsedAt = lastUsedAtIso

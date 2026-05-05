@@ -7,6 +7,10 @@ android {
     namespace 'com.guardian.app'
     compileSdk 34
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId "com.guardian.app"
         minSdk 26
@@ -15,10 +19,30 @@ android {
         versionName "1.0.0"
     }
 
+    // ── 环境 Flavor：device = 真机（局域网 IP），emulator = 模拟器（宿主机别名）──
+    flavorDimensions = ["env"]
+    productFlavors {
+        device {
+            dimension "env"
+            // 真机与 PC 同一 Wi-Fi，直接用局域网 IP
+            buildConfigField "String", "SERVER_URL", '"http://192.168.1.165:8080/"'
+        }
+        emulator {
+            dimension "env"
+            // 10.0.2.2 是模拟器内置别名，固定指向宿主机 localhost
+            buildConfigField "String", "SERVER_URL", '"http://10.0.2.2:8080/"'
+        }
+    }
+
     buildTypes {
+        debug {
+            // SERVER_URL 由 productFlavors 注入，此处不再重复声明
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // release 固定用真实服务器地址（上线时改这里）
+            buildConfigField "String", "SERVER_URL", '"http://192.168.1.165:8080/"'
         }
     }
 
@@ -52,6 +76,5 @@ dependencies {
     // WorkManager（后台周期性任务，提供 CoroutineWorker）
     implementation 'androidx.work:work-runtime-ktx:2.9.0'
 
-    // Kotlin 标准库
-    implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'
+    // Kotlin 标准库由 Kotlin Gradle 插件自动注入（与插件版本保持一致，勿手动覆盖）
 }

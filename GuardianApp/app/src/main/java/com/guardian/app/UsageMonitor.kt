@@ -69,7 +69,9 @@ class UsageMonitor(private val context: Context) {
         if (stats.isNullOrEmpty()) return Result.Unavailable
 
         val lastUsedAt = stats
-            .filter { it.lastTimeUsed > 0L }        // 排除从未被系统记录使用的条目
+            // 只保留曾在前台展示过的应用（排除仅被后台唤醒的推送/同步服务），
+            // 避免误报"用户最后使用时间"
+            .filter { it.totalTimeInForeground > 0L }
             .maxOfOrNull { it.lastTimeUsed }
             ?: return Result.Unavailable
 

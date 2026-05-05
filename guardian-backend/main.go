@@ -2,14 +2,22 @@ package main
 
 import (
 	"crypto/rand"
+	"database/sql"
+	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
+	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/time/rate"
+	_ "modernc.org/sqlite"
 )
 
 // ────────────────────────────────────────────
@@ -19,8 +27,8 @@ import (
 type Role string
 
 const (
-	RoleGuardian Role = "guardian" // 监护者
-	RoleWard     Role = "ward"     // 被监护者
+	RoleGuardian Role = "guardian"
+	RoleWard     Role = "ward"
 )
 
 // Device 设备实体
@@ -29,17 +37,8 @@ type Device struct {
 	Role       Role       `json:"role"`
 	Latitude   float64    `json:"latitude"`
 	Longitude  float64    `json:"longitude"`
-	LastSeen   time.Time  `json:"last_seen"`   // 服务端最后收到数据的时间
-	LastUsedAt *time.Time `json:"last_used_at"` // 被监护者手机最后使用时间（由客户端上报）
-}
-
-// PairingSession 旧式配对会话（保留兼容）
-type PairingSession struct {
-	SessionID   string    `json:"session_id"`
-	GuardianID  string    `json:"guardian_id"`
-	WardID      string    `json:"ward_id"`
-	CreatedAt   time.Time `json:"created_at"`
-	IsConfirmed bool      `json:"is_confirmed"`
+	LastSeen   time.Time  `json:"last_seen"`
+	LastUsedAt *time.Time `json:"last_used_at"`
 }
 
 // PairingCode 临时配对码（被监护者生成，5分钟有效）
@@ -57,125 +56,320 @@ type Binding struct {
 }
 
 // ────────────────────────────────────────────
-// 内存存储
+// JWT
+// ────────────────────────────────────────────
+
+var jwtSecret []byte
+
+// DeviceClaims JWT payload：设备身份
+type DeviceClaims struct {
+	UUID string `json:"uuid"`
+	Role Role   `json:"role"`
+	jwt.RegisteredClaims
+}
+
+// generateToken 为设备签发 JWT（有效期 1 年）
+func generateToken(uuid string, role Role) (string, error) {
+	claims := DeviceClaims{
+		UUID: uuid,
+		Role: role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(365 * 24 * time.Hour)),
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(jwtSecret)
+}
+
+// corsMiddleware 允许前端跨域访问（开发环境 Vite dev server / 生产环境独立部署）
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+// authMiddleware 校验 Authorization: Bearer <token>，通过后将 uuid/role 注入 gin.Context
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := c.GetHeader("Authorization")
+		if !strings.HasPrefix(header, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized,
+				gin.H{"error": "missing or invalid authorization header"})
+			return
+		}
+
+		claims := &DeviceClaims{}
+		token, err := jwt.ParseWithClaims(
+			strings.TrimPrefix(header, "Bearer "),
+			claims,
+			func(t *jwt.Token) (interface{}, error) {
+				if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+				}
+				return jwtSecret, nil
+			},
+		)
+		if err != nil || !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+			return
+		}
+		c.Set("uuid", claims.UUID)
+		c.Set("role", string(claims.Role))
+		c.Next()
+	}
+}
+
+// ────────────────────────────────────────────
+// SQLite 存储
 // ────────────────────────────────────────────
 
 type Store struct {
-	mu sync.RWMutex
-
-	devices  map[string]*Device
-	sessions map[string]*PairingSession
-
-	// 配对码：code -> PairingCode
-	pairingCodes map[string]*PairingCode
-	// 每个 ward 只允许一个有效码，记录其当前 code（生成新码时自动废弃旧码）
-	wardCode map[string]string
-	// 绑定关系：uuid -> *Binding（guardian 和 ward 共享同一个指针，双向可查）
-	bindings map[string]*Binding
+	db *sql.DB
 }
 
-func NewStore() *Store {
-	return &Store{
-		devices:      make(map[string]*Device),
-		sessions:     make(map[string]*PairingSession),
-		pairingCodes: make(map[string]*PairingCode),
-		wardCode:     make(map[string]string),
-		bindings:     make(map[string]*Binding),
+func NewStore(db *sql.DB) *Store {
+	return &Store{db: db}
+}
+
+// initDB 创建数据表，开启 WAL 模式提升并发读性能
+func initDB(db *sql.DB) error {
+	stmts := []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA foreign_keys=ON`,
+		`CREATE TABLE IF NOT EXISTS devices (
+			uuid         TEXT PRIMARY KEY,
+			role         TEXT NOT NULL,
+			latitude     REAL NOT NULL DEFAULT 0,
+			longitude    REAL NOT NULL DEFAULT 0,
+			last_seen    TEXT NOT NULL,
+			last_used_at TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS bindings (
+			guardian_id TEXT NOT NULL UNIQUE,
+			ward_id     TEXT NOT NULL UNIQUE,
+			created_at  TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS pairing_codes (
+			code       TEXT PRIMARY KEY,
+			ward_id    TEXT NOT NULL UNIQUE,
+			expires_at TEXT NOT NULL
+		)`,
 	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("initDB: %w", err)
+		}
+	}
+	return nil
+}
+
+// parseTime 解析 RFC3339 时间字符串，解析失败返回零值
+func parseTime(s string) time.Time {
+	t, _ := time.Parse(time.RFC3339, s)
+	return t
 }
 
 // ── Device ──
 
-func (s *Store) GetDevice(id string) (*Device, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	d, ok := s.devices[id]
-	return d, ok
+func (s *Store) GetDevice(uuid string) (*Device, bool) {
+	var d Device
+	var lastSeen string
+	var lastUsedAt sql.NullString
+
+	err := s.db.QueryRow(
+		`SELECT uuid, role, latitude, longitude, last_seen, last_used_at
+		 FROM devices WHERE uuid = ?`, uuid,
+	).Scan(&d.UUID, &d.Role, &d.Latitude, &d.Longitude, &lastSeen, &lastUsedAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false
+	}
+	if err != nil {
+		log.Printf("GetDevice error: %v", err)
+		return nil, false
+	}
+	d.LastSeen = parseTime(lastSeen)
+	if lastUsedAt.Valid {
+		t := parseTime(lastUsedAt.String)
+		d.LastUsedAt = &t
+	}
+	return &d, true
 }
 
-func (s *Store) UpsertDevice(d *Device) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.devices[d.UUID] = d
+// UpsertDevice 注册或更新设备（角色可覆盖，坐标保留）
+func (s *Store) UpsertDevice(d *Device) error {
+	_, err := s.db.Exec(
+		`INSERT INTO devices (uuid, role, latitude, longitude, last_seen)
+		 VALUES (?, ?, 0, 0, ?)
+		 ON CONFLICT(uuid) DO UPDATE SET
+		     role      = excluded.role,
+		     last_seen = excluded.last_seen`,
+		d.UUID, string(d.Role), d.LastSeen.Format(time.RFC3339),
+	)
+	return err
 }
 
-// ── PairingSession（旧） ──
-
-func (s *Store) GetSession(id string) (*PairingSession, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	ps, ok := s.sessions[id]
-	return ps, ok
-}
-
-func (s *Store) CreateSession(ps *PairingSession) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[ps.SessionID] = ps
-}
-
-func (s *Store) UpdateSession(ps *PairingSession) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[ps.SessionID] = ps
+// UpdateDeviceData 原子更新 ward 设备的坐标和最后使用时间，消除 TOCTOU 竞态
+func (s *Store) UpdateDeviceData(uuid string, lat, lng float64, lastUsedAt time.Time) error {
+	_, err := s.db.Exec(
+		`UPDATE devices SET latitude = ?, longitude = ?, last_seen = ?, last_used_at = ?
+		 WHERE uuid = ?`,
+		lat, lng, time.Now().Format(time.RFC3339), lastUsedAt.Format(time.RFC3339), uuid,
+	)
+	return err
 }
 
 // ── PairingCode ──
 
-// StorePairingCode 为 ward 存储新配对码，自动废弃其旧码（如有）
-func (s *Store) StorePairingCode(wardID, code string, expiry time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if old, ok := s.wardCode[wardID]; ok {
-		delete(s.pairingCodes, old)
+// StorePairingCode 原子替换 ward 的配对码（旧码自动废弃）
+func (s *Store) StorePairingCode(wardID, code string, expiry time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	s.pairingCodes[code] = &PairingCode{Code: code, WardID: wardID, ExpiresAt: expiry}
-	s.wardCode[wardID] = code
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(`DELETE FROM pairing_codes WHERE ward_id = ?`, wardID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO pairing_codes (code, ward_id, expires_at) VALUES (?, ?, ?)`,
+		code, wardID, expiry.Format(time.RFC3339),
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// ConsumePairingCode 校验并原子消费配对码，成功返回 wardID
-func (s *Store) ConsumePairingCode(code string) (wardID string, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pc, ok := s.pairingCodes[code]
-	if !ok {
+// ConsumePairingCode 原子校验并删除配对码，返回 wardID
+func (s *Store) ConsumePairingCode(code string) (string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var wardID, expiresAtStr string
+	err = tx.QueryRow(
+		`SELECT ward_id, expires_at FROM pairing_codes WHERE code = ?`, code,
+	).Scan(&wardID, &expiresAtStr)
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("invalid pairing code")
 	}
-	if time.Now().After(pc.ExpiresAt) {
-		delete(s.pairingCodes, code)
-		delete(s.wardCode, pc.WardID)
+	if err != nil {
+		return "", err
+	}
+
+	if time.Now().After(parseTime(expiresAtStr)) {
+		tx.Exec(`DELETE FROM pairing_codes WHERE code = ?`, code) //nolint:errcheck
+		tx.Commit()                                                //nolint:errcheck
 		return "", fmt.Errorf("pairing code expired")
 	}
-	// 一次性消费，防止重放
-	delete(s.pairingCodes, code)
-	delete(s.wardCode, pc.WardID)
-	return pc.WardID, nil
+
+	if _, err := tx.Exec(`DELETE FROM pairing_codes WHERE code = ?`, code); err != nil {
+		return "", err
+	}
+	return wardID, tx.Commit()
+}
+
+// CleanExpiredCodes 删除所有已过期配对码（后台定时调用）
+func (s *Store) CleanExpiredCodes() {
+	if _, err := s.db.Exec(
+		`DELETE FROM pairing_codes WHERE expires_at < ?`, time.Now().Format(time.RFC3339),
+	); err != nil {
+		log.Printf("CleanExpiredCodes error: %v", err)
+	}
 }
 
 // ── Binding ──
 
-func (s *Store) CreateBinding(guardianID, wardID string) *Binding {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b := &Binding{GuardianID: guardianID, WardID: wardID, CreatedAt: time.Now()}
-	// 双向写入同一个指针，任意一方 uuid 均可查询
-	s.bindings[guardianID] = b
-	s.bindings[wardID] = b
-	return b
+func (s *Store) CreateBinding(guardianID, wardID string) (*Binding, error) {
+	now := time.Now()
+	_, err := s.db.Exec(
+		`INSERT INTO bindings (guardian_id, ward_id, created_at) VALUES (?, ?, ?)`,
+		guardianID, wardID, now.Format(time.RFC3339),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &Binding{GuardianID: guardianID, WardID: wardID, CreatedAt: now}, nil
 }
 
+// GetBinding 通过 guardian 或 ward 的 UUID 查询绑定关系
 func (s *Store) GetBinding(id string) (*Binding, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	b, ok := s.bindings[id]
-	return b, ok
+	var b Binding
+	var createdAt string
+	err := s.db.QueryRow(
+		`SELECT guardian_id, ward_id, created_at FROM bindings
+		 WHERE guardian_id = ? OR ward_id = ?`, id, id,
+	).Scan(&b.GuardianID, &b.WardID, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false
+	}
+	if err != nil {
+		log.Printf("GetBinding error: %v", err)
+		return nil, false
+	}
+	b.CreatedAt = parseTime(createdAt)
+	return &b, true
 }
 
 // ────────────────────────────────────────────
 // 工具函数
 // ────────────────────────────────────────────
 
-// generateCode 用 crypto/rand 生成6位数字配对码（000000-999999）
+// uuidRegex 预编译，匹配标准 UUID v4 格式（小写，含连字符）
+var uuidRegex = regexp.MustCompile(
+	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
+)
+
+func isValidUUID(s string) bool { return uuidRegex.MatchString(s) }
+
+// ── Per-IP 限速（令牌桶） ──────────────────────────────────
+
+type ipLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+var (
+	ipLimiters sync.Map        // map[string]*ipLimiter
+	// 每 IP 每分钟最多 10 次（针对配对码暴力破解保护）
+	rateLimit  = rate.Every(6 * time.Second) // 10 req/min
+	rateBurst  = 10
+)
+
+// getLimiter 返回该 IP 对应的令牌桶，不存在则创建
+func getLimiter(ip string) *rate.Limiter {
+	v, _ := ipLimiters.LoadOrStore(ip, &ipLimiter{
+		limiter:  rate.NewLimiter(rateLimit, rateBurst),
+		lastSeen: time.Now(),
+	})
+	l := v.(*ipLimiter)
+	l.lastSeen = time.Now()
+	return l.limiter
+}
+
+// rateLimitMiddleware 对指定路由施加 per-IP 限速，超限返回 429
+func rateLimitMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !getLimiter(c.ClientIP()).Allow() {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests,
+				gin.H{"error": "too many requests, please try again later"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// generateCode 用 crypto/rand 生成 6 位数字配对码
 func generateCode() (string, error) {
 	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
 	if err != nil {
@@ -185,11 +379,12 @@ func generateCode() (string, error) {
 }
 
 // ────────────────────────────────────────────
-// Handlers — 设备
+// Handlers — 设备（公开路由）
 // ────────────────────────────────────────────
 
-// POST /devices/register
+// POST /devices/register（公开，无需 token）
 // Body: { "uuid": "...", "role": "guardian"|"ward" }
+// Response: { "device": {...}, "token": "..." }
 func registerDevice(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
@@ -204,128 +399,41 @@ func registerDevice(store *Store) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "role must be 'guardian' or 'ward'"})
 			return
 		}
+		if !isValidUUID(req.UUID) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "uuid must be a valid UUID v4 (lowercase, hyphenated)"})
+			return
+		}
+
 		device := &Device{UUID: req.UUID, Role: req.Role, LastSeen: time.Now()}
-		store.UpsertDevice(device)
-		c.JSON(http.StatusOK, device)
-	}
-}
+		if err := store.UpsertDevice(device); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register device"})
+			return
+		}
 
-// GET /devices/:uuid
-func getDevice(store *Store) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		device, ok := store.GetDevice(c.Param("uuid"))
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
+		token, err := generateToken(req.UUID, req.Role)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 			return
 		}
-		c.JSON(http.StatusOK, device)
-	}
-}
 
-// PUT /devices/:uuid/location
-// Body: { "latitude": 39.9, "longitude": 116.4 }
-func updateLocation(store *Store) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req struct {
-			Latitude  float64 `json:"latitude"  binding:"required"`
-			Longitude float64 `json:"longitude" binding:"required"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		device, ok := store.GetDevice(c.Param("uuid"))
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
-			return
-		}
-		device.Latitude = req.Latitude
-		device.Longitude = req.Longitude
-		device.LastSeen = time.Now()
-		store.UpsertDevice(device)
-		c.JSON(http.StatusOK, device)
+		c.JSON(http.StatusOK, gin.H{"device": device, "token": token})
 	}
 }
 
 // ────────────────────────────────────────────
-// Handlers — 旧式会话（保留）
+// Handlers — 配对（受保护路由）
 // ────────────────────────────────────────────
 
-// POST /sessions
-func createSession(store *Store) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req struct {
-			GuardianID string `json:"guardian_id" binding:"required"`
-			WardID     string `json:"ward_id"     binding:"required"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		ps := &PairingSession{
-			SessionID:  uuid.NewString(),
-			GuardianID: req.GuardianID,
-			WardID:     req.WardID,
-			CreatedAt:  time.Now(),
-		}
-		store.CreateSession(ps)
-		c.JSON(http.StatusCreated, ps)
-	}
-}
-
-// PUT /sessions/:id/confirm
-func confirmSession(store *Store) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		ps, ok := store.GetSession(c.Param("id"))
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
-			return
-		}
-		ps.IsConfirmed = true
-		store.UpdateSession(ps)
-		c.JSON(http.StatusOK, ps)
-	}
-}
-
-// GET /sessions/:id
-func getSession(store *Store) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		ps, ok := store.GetSession(c.Param("id"))
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
-			return
-		}
-		c.JSON(http.StatusOK, ps)
-	}
-}
-
-// ────────────────────────────────────────────
-// Handlers — 双向配对（新）
-// ────────────────────────────────────────────
-
-// POST /pair/generate
-// 被监护者调用，生成6位配对码（有效5分钟）
-// Body: { "ward_uuid": "..." }
+// POST /pair/generate（受保护，仅 ward 调用）
+// 无需 request body；ward UUID 从 JWT claims 获取
 func generatePairing(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var req struct {
-			WardUUID string `json:"ward_uuid" binding:"required"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-
-		device, ok := store.GetDevice(req.WardUUID)
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
-			return
-		}
-		if device.Role != RoleWard {
+		uuid := c.GetString("uuid")
+		if Role(c.GetString("role")) != RoleWard {
 			c.JSON(http.StatusForbidden, gin.H{"error": "only ward devices can generate a pairing code"})
 			return
 		}
-		if _, bound := store.GetBinding(req.WardUUID); bound {
+		if _, bound := store.GetBinding(uuid); bound {
 			c.JSON(http.StatusConflict, gin.H{"error": "device is already paired"})
 			return
 		}
@@ -337,69 +445,57 @@ func generatePairing(store *Store) gin.HandlerFunc {
 		}
 
 		expiry := time.Now().Add(5 * time.Minute)
-		store.StorePairingCode(req.WardUUID, code, expiry)
+		if err := store.StorePairingCode(uuid, code, expiry); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store pairing code"})
+			return
+		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"pairing_code": code,
-			"expires_at":   expiry,
-		})
+		c.JSON(http.StatusOK, gin.H{"pairing_code": code, "expires_at": expiry})
 	}
 }
 
-// POST /pair/confirm
-// 监护者调用，输入配对码完成双向绑定
-// Body: { "guardian_uuid": "...", "pairing_code": "123456" }
+// POST /pair/confirm（受保护，仅 guardian 调用）
+// Body: { "pairing_code": "123456" }
 func confirmPairing(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			GuardianUUID string `json:"guardian_uuid" binding:"required"`
-			PairingCode  string `json:"pairing_code"  binding:"required"`
+			PairingCode string `json:"pairing_code" binding:"required"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 
-		device, ok := store.GetDevice(req.GuardianUUID)
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
-			return
-		}
-		if device.Role != RoleGuardian {
+		uuid := c.GetString("uuid")
+		if Role(c.GetString("role")) != RoleGuardian {
 			c.JSON(http.StatusForbidden, gin.H{"error": "only guardian devices can confirm pairing"})
 			return
 		}
-		if _, bound := store.GetBinding(req.GuardianUUID); bound {
+		if _, bound := store.GetBinding(uuid); bound {
 			c.JSON(http.StatusConflict, gin.H{"error": "device is already paired"})
 			return
 		}
 
-		// 原子消费配对码：校验 + 过期检查 + 一次性删除
 		wardID, err := store.ConsumePairingCode(req.PairingCode)
 		if err != nil {
 			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 			return
 		}
 
-		binding := store.CreateBinding(req.GuardianUUID, wardID)
+		binding, err := store.CreateBinding(uuid, wardID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create binding"})
+			return
+		}
 		c.JSON(http.StatusOK, binding)
 	}
 }
 
-// GET /pair/status?uuid=xxx
-// 查询任意设备的绑定状态
+// GET /pair/status（受保护）
+// 返回当前认证设备的配对状态
 func pairingStatus(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := c.Query("uuid")
-		if id == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "uuid query param is required"})
-			return
-		}
-		if _, ok := store.GetDevice(id); !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
-			return
-		}
-		binding, ok := store.GetBinding(id)
+		binding, ok := store.GetBinding(c.GetString("uuid"))
 		if !ok {
 			c.JSON(http.StatusOK, gin.H{"paired": false})
 			return
@@ -409,16 +505,15 @@ func pairingStatus(store *Store) gin.HandlerFunc {
 }
 
 // ────────────────────────────────────────────
-// Handlers — 数据同步
+// Handlers — 数据同步（受保护路由）
 // ────────────────────────────────────────────
 
-// POST /data/update
-// 被监护者调用，上报当前位置与手机最后使用时间
-// Body: { "uuid": "...", "lat": 39.9, "lng": 116.4, "last_used_at": "2006-01-02T15:04:05Z" }
+// POST /data/update（受保护，仅 ward 调用）
+// Body: { "lat": 39.9, "lng": 116.4, "last_used_at": "2006-01-02T15:04:05Z" }
+// uuid 从 JWT claims 获取，消除 TOCTOU 竞态
 func dataUpdate(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			UUID       string    `json:"uuid"         binding:"required"`
 			Lat        float64   `json:"lat"          binding:"required"`
 			Lng        float64   `json:"lng"          binding:"required"`
 			LastUsedAt time.Time `json:"last_used_at" binding:"required"`
@@ -428,51 +523,35 @@ func dataUpdate(store *Store) gin.HandlerFunc {
 			return
 		}
 
-		device, ok := store.GetDevice(req.UUID)
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
-			return
-		}
-		if device.Role != RoleWard {
+		uuid := c.GetString("uuid")
+		if Role(c.GetString("role")) != RoleWard {
 			c.JSON(http.StatusForbidden, gin.H{"error": "only ward devices can call this endpoint"})
 			return
 		}
-		if _, bound := store.GetBinding(req.UUID); !bound {
+		if _, bound := store.GetBinding(uuid); !bound {
 			c.JSON(http.StatusForbidden, gin.H{"error": "device is not paired"})
 			return
 		}
 
-		device.Latitude = req.Lat
-		device.Longitude = req.Lng
-		device.LastSeen = time.Now()
-		device.LastUsedAt = &req.LastUsedAt
-		store.UpsertDevice(device)
-
+		if err := store.UpdateDeviceData(uuid, req.Lat, req.Lng, req.LastUsedAt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update data"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"message": "updated"})
 	}
 }
 
-// GET /data/latest?uuid=<guardian_uuid>
-// 监护者调用，获取被监护者最新位置和最后使用时间
+// GET /data/latest（受保护，仅 guardian 调用）
+// guardianUUID 从 JWT claims 获取
 func dataLatest(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		guardianID := c.Query("uuid")
-		if guardianID == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "uuid query param is required"})
-			return
-		}
-
-		device, ok := store.GetDevice(guardianID)
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "device not found"})
-			return
-		}
-		if device.Role != RoleGuardian {
+		uuid := c.GetString("uuid")
+		if Role(c.GetString("role")) != RoleGuardian {
 			c.JSON(http.StatusForbidden, gin.H{"error": "only guardian devices can call this endpoint"})
 			return
 		}
 
-		binding, bound := store.GetBinding(guardianID)
+		binding, bound := store.GetBinding(uuid)
 		if !bound {
 			c.JSON(http.StatusNotFound, gin.H{"error": "no pairing found for this guardian"})
 			return
@@ -485,10 +564,10 @@ func dataLatest(store *Store) gin.HandlerFunc {
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"ward_uuid":   ward.UUID,
-			"latitude":    ward.Latitude,
-			"longitude":   ward.Longitude,
-			"last_seen":   ward.LastSeen,
+			"ward_uuid":    ward.UUID,
+			"latitude":     ward.Latitude,
+			"longitude":    ward.Longitude,
+			"last_seen":    ward.LastSeen,
 			"last_used_at": ward.LastUsedAt,
 		})
 	}
@@ -499,40 +578,84 @@ func dataLatest(store *Store) gin.HandlerFunc {
 // ────────────────────────────────────────────
 
 func main() {
-	store := NewStore()
-	// gin.Default() 已内置 gin.Logger()（请求日志）和 gin.Recovery()（panic 恢复）
+	// JWT 密钥从环境变量读取，缺失则启动失败（快速失败原则）
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		log.Fatal("JWT_SECRET environment variable is required")
+	}
+	jwtSecret = []byte(secret)
+
+	// SQLite 数据库路径，默认 guardian.db
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "guardian.db"
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		log.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	if err := initDB(db); err != nil {
+		log.Fatalf("failed to initialize database: %v", err)
+	}
+
+	store := NewStore(db)
+
+	// 后台定时：清理过期配对码（每分钟）+ 清理不活跃 IP limiter（每10分钟）
+	go func() {
+		codeTicker := time.NewTicker(time.Minute)
+		ipTicker   := time.NewTicker(10 * time.Minute)
+		defer codeTicker.Stop()
+		defer ipTicker.Stop()
+		for {
+			select {
+			case <-codeTicker.C:
+				store.CleanExpiredCodes()
+			case <-ipTicker.C:
+				cutoff := time.Now().Add(-10 * time.Minute)
+				ipLimiters.Range(func(k, v any) bool {
+					if v.(*ipLimiter).lastSeen.Before(cutoff) {
+						ipLimiters.Delete(k)
+					}
+					return true
+				})
+			}
+		}
+	}()
+
 	r := gin.Default()
+	r.Use(corsMiddleware())
 
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "pong"})
 	})
 
-	devices := r.Group("/devices")
+	// 公开路由（无需 token）
+	r.POST("/devices/register", registerDevice(store))
+
+	// 受保护路由（需要有效 JWT）
+	auth := r.Group("/")
+	auth.Use(authMiddleware())
 	{
-		devices.POST("/register", registerDevice(store))
-		devices.GET("/:uuid", getDevice(store))
-		devices.PUT("/:uuid/location", updateLocation(store))
+		pair := auth.Group("/pair")
+		{
+			pair.POST("/generate", generatePairing(store))
+			// /confirm 施加 per-IP 限速，防止暴力穷举 6 位配对码
+			pair.POST("/confirm", rateLimitMiddleware(), confirmPairing(store))
+			pair.GET("/status", pairingStatus(store))
+		}
+
+		data := auth.Group("/data")
+		{
+			data.POST("/update", dataUpdate(store))
+			data.GET("/latest", dataLatest(store))
+		}
 	}
 
-	sessions := r.Group("/sessions")
-	{
-		sessions.POST("", createSession(store))
-		sessions.GET("/:id", getSession(store))
-		sessions.PUT("/:id/confirm", confirmSession(store))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-
-	pair := r.Group("/pair")
-	{
-		pair.POST("/generate", generatePairing(store))
-		pair.POST("/confirm", confirmPairing(store))
-		pair.GET("/status", pairingStatus(store))
-	}
-
-	data := r.Group("/data")
-	{
-		data.POST("/update", dataUpdate(store))
-		data.GET("/latest", dataLatest(store))
-	}
-
-	r.Run(":8080")
+	r.Run(":" + port)
 }

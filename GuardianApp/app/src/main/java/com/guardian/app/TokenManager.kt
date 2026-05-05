@@ -83,8 +83,21 @@ class TokenManager(context: Context) {
 
     // ── 重置 ──────────────────────────────────────────────────
 
+    // ── JWT Token ─────────────────────────────────────────────
+
     /**
-     * 清除所有本地状态（角色 + UUID）。
+     * 服务端注册成功后下发的 JWT token。
+     * 所有受保护接口的请求头 `Authorization: Bearer <token>` 均来自此字段。
+     * 未完成注册时为 null，ApiClient 会跳过添加 header。
+     */
+    var authToken: String?
+        get() = prefs.getString(KEY_TOKEN, null)
+        set(value) { prefs.edit().putString(KEY_TOKEN, value).apply() }
+
+    // ── 重置 ──────────────────────────────────────────────────
+
+    /**
+     * 清除所有本地状态（角色 + UUID + token）。
      * 适用于解绑 / 出厂重置场景；下次访问 [deviceUuid] 将重新生成。
      */
     fun clear() = prefs.edit().clear().apply()
@@ -95,5 +108,6 @@ class TokenManager(context: Context) {
         private const val PREFS_NAME = "guardian_prefs"
         private const val KEY_UUID   = "device_uuid"
         private const val KEY_ROLE   = "device_role"
+        private const val KEY_TOKEN  = "auth_token"
     }
 }

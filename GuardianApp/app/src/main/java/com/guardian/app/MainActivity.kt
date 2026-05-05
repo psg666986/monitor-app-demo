@@ -6,171 +6,415 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
-import android.util.Log
+import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.guardian.app.network.ApiClient
 import com.guardian.app.network.ConfirmPairingRequest
-import com.guardian.app.network.GeneratePairingRequest
 import com.guardian.app.network.RegisterRequest
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+import kotlin.math.abs
 
 /**
- * 调试专用 Activity：无 XML 布局，所有输出走 Logcat。
+ * 应用主 Activity。
  *
- * 启动后按顺序执行：
- *  1. 动态申请位置权限（前台 → 后台，分两步）
- *  2. 检测 PACKAGE_USAGE_STATS 权限，未授权时跳转系统设置
- *  3. 打印本机 UUID 和当前角色
- *
- * 三个测试按钮分别对应 [testGenerateCode] / [testConfirmCode] / [testFetchData]，
- * 所有结果均通过 `Log.i(TAG, ...)` 输出，用 Logcat 过滤 TAG="MainActivity" 查看。
+ * 实现三屏状态机（无 XML 布局，动态切换）：
+ *  - [Screen.ROLE_SELECT]  首次启动，选择角色并完成设备注册
+ *  - [Screen.WARD]         被监护者视图：生成/展示配对码、同步状态、权限状态
+ *  - [Screen.GUARDIAN]     监护者视图：输入配对码、查看被监护者数据
  */
 class MainActivity : Activity() {
 
-    // ── 协程作用域（与 Activity 生命周期绑定）────────────────
+    private enum class Screen { ROLE_SELECT, WARD, GUARDIAN }
+
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-
     private val tokenManager by lazy { TokenManager(this) }
+    private val handler = Handler(Looper.getMainLooper())
 
-    // 配对码输入框（在 buildLayout() 中初始化）
-    private lateinit var codeInput: EditText
+    // ── 跨屏共享根布局 ────────────────────────────────────────
+    private lateinit var rootScroll: ScrollView
+    private lateinit var rootLinear: LinearLayout
+
+    // ── Ward 屏动态组件 ───────────────────────────────────────
+    private lateinit var wardPairingStatus: TextView
+    private lateinit var wardCodeCard: LinearLayout    // 配对码大字 + 倒计时（可见/隐藏）
+    private lateinit var wardCodeText: TextView
+    private lateinit var wardCodeExpiry: TextView
+    private lateinit var wardGenBtn: Button
+    private lateinit var wardPermLocation: TextView
+    private lateinit var wardPermUsage: TextView
+
+    private var codeExpiresAt: Long = 0L
+    private val countdownRunnable = object : Runnable {
+        override fun run() {
+            val remaining = ((codeExpiresAt - System.currentTimeMillis()) / 1000).coerceAtLeast(0)
+            wardCodeExpiry.text = getString(R.string.ward_code_expires, remaining)
+            if (remaining > 0) handler.postDelayed(this, 1000)
+            else wardCodeCard.visibility = View.GONE
+        }
+    }
+
+    // ── Guardian 屏动态组件 ───────────────────────────────────
+    private lateinit var guardianPairingStatus: TextView
+    private lateinit var guardianInputArea: LinearLayout   // 未配对时展示
+    private lateinit var guardianCodeInput: EditText
+    private lateinit var guardianDataCard: LinearLayout    // 已配对时展示
+    private lateinit var guardianWardUuid: TextView
+    private lateinit var guardianLocation: TextView
+    private lateinit var guardianLastUsed: TextView
+    private lateinit var guardianLastSeen: TextView
 
     // ── 生命周期 ─────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(buildLayout())
+        rootLinear = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(40), dp(20), dp(32))
+        }
+        rootScroll = ScrollView(this).apply { addView(rootLinear) }
+        setContentView(rootScroll)
 
-        // Step 1: 打印设备信息
-        logDeviceInfo()
-
-        // Step 2: 申请位置权限（前台部分；后台位置在回调中追加）
-        requestForegroundLocation()
-
-        // Step 3: 检测使用情况统计权限
-        checkUsageStatsPermission()
+        // 根据已保存角色决定展示哪个屏
+        when (tokenManager.deviceRole) {
+            DeviceRole.WARD     -> showScreen(Screen.WARD)
+            DeviceRole.GUARDIAN -> showScreen(Screen.GUARDIAN)
+            null                -> showScreen(Screen.ROLE_SELECT)
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        scope.cancel()          // 避免 Activity 销毁后协程泄漏
+        handler.removeCallbacks(countdownRunnable)
+        scope.cancel()
     }
 
-    // ── 极简 UI（全程序构建，无 XML）────────────────────────
-
-    private fun buildLayout(): ScrollView {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(20.dp(), 32.dp(), 20.dp(), 32.dp())
+    override fun onResume() {
+        super.onResume()
+        // 每次回到前台刷新权限状态显示
+        if (tokenManager.deviceRole == DeviceRole.WARD && ::wardPermLocation.isInitialized) {
+            refreshPermissionStatus()
         }
+    }
 
-        // 标题
-        root.addView(TextView(this).apply {
-            text = "Guardian Debug Console"
+    // ── 屏幕切换 ─────────────────────────────────────────────
+
+    private fun showScreen(screen: Screen) {
+        rootLinear.removeAllViews()
+        when (screen) {
+            Screen.ROLE_SELECT -> buildRoleSelectScreen()
+            Screen.WARD        -> buildWardScreen()
+            Screen.GUARDIAN    -> buildGuardianScreen()
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ROLE SELECT 屏
+    // ═══════════════════════════════════════════════════════════
+
+    private fun buildRoleSelectScreen() {
+        rootLinear.addView(textView(getString(R.string.role_select_title), 26f, bold = true,
+            gravity = Gravity.CENTER_HORIZONTAL))
+        rootLinear.addView(spacer(dp(8)))
+        rootLinear.addView(textView(getString(R.string.role_select_subtitle), 15f,
+            color = 0xFF888888.toInt(), gravity = Gravity.CENTER_HORIZONTAL))
+        rootLinear.addView(spacer(dp(48)))
+
+        rootLinear.addView(bigButton(getString(R.string.role_guardian), 0xFF1976D2.toInt()) {
+            registerAs(DeviceRole.GUARDIAN)
+        })
+        rootLinear.addView(spacer(dp(16)))
+        rootLinear.addView(bigButton(getString(R.string.role_ward), 0xFF388E3C.toInt()) {
+            registerAs(DeviceRole.WARD)
+        })
+    }
+
+    private fun registerAs(role: DeviceRole) {
+        val uuid = tokenManager.deviceUuid
+        scope.launch {
+            val loadingToast = Toast.makeText(this@MainActivity,
+                getString(R.string.loading), Toast.LENGTH_SHORT)
+            loadingToast.show()
+            try {
+                val resp = withContext(Dispatchers.IO) {
+                    ApiClient.api.registerDevice(RegisterRequest(uuid, role.value))
+                }
+                tokenManager.authToken = resp.token
+                tokenManager.deviceRole = role
+                loadingToast.cancel()
+
+                if (role == DeviceRole.WARD) {
+                    DataSyncWorker.schedule(this@MainActivity)
+                    showScreen(Screen.WARD)
+                    requestForegroundLocation()
+                } else {
+                    GuardianPollWorker.schedule(this@MainActivity)
+                    maybeRequestNotificationPermission()
+                    showScreen(Screen.GUARDIAN)
+                }
+            } catch (e: Exception) {
+                loadingToast.cancel()
+                Toast.makeText(this@MainActivity,
+                    getString(R.string.error_network), Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // WARD 屏
+    // ═══════════════════════════════════════════════════════════
+
+    private fun buildWardScreen() {
+        // 顶部身份栏
+        rootLinear.addView(identityHeader(
+            getString(R.string.ward_title),
+            tokenManager.deviceUuid.take(8)
+        ))
+        rootLinear.addView(divider())
+
+        // 配对状态
+        wardPairingStatus = textView(getString(R.string.ward_pairing_status_unpaired), 15f,
+            color = 0xFFE53935.toInt())
+        rootLinear.addView(sectionLabel("配对状态"))
+        rootLinear.addView(wardPairingStatus)
+
+        // 配对码卡片（默认隐藏）
+        wardCodeCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setBackgroundColor(0xFFF5F5F5.toInt())
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+        }
+        wardCodeText = textView("------", 48f, bold = true, gravity = Gravity.CENTER_HORIZONTAL,
+            color = 0xFF1976D2.toInt())
+        wardCodeExpiry = textView("", 13f, color = 0xFF888888.toInt(),
+            gravity = Gravity.CENTER_HORIZONTAL)
+        wardCodeCard.addView(textView(getString(R.string.ward_code_hint), 13f,
+            color = 0xFF888888.toInt(), gravity = Gravity.CENTER_HORIZONTAL))
+        wardCodeCard.addView(wardCodeText)
+        wardCodeCard.addView(wardCodeExpiry)
+        rootLinear.addView(wardCodeCard)
+        rootLinear.addView(spacer(dp(8)))
+
+        // 生成配对码按钮
+        wardGenBtn = button(getString(R.string.ward_btn_generate_code)) { generatePairingCode() }
+        rootLinear.addView(wardGenBtn)
+        rootLinear.addView(divider())
+
+        // 权限状态
+        rootLinear.addView(sectionLabel("权限状态"))
+        wardPermLocation = clickableText("") { requestForegroundLocation() }
+        wardPermUsage = clickableText("") {
+            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+        }
+        rootLinear.addView(wardPermLocation)
+        rootLinear.addView(wardPermUsage)
+
+        // 初始化状态
+        refreshPermissionStatus()
+        refreshWardPairingStatus()
+    }
+
+    private fun generatePairingCode() {
+        wardGenBtn.isEnabled = false
+        scope.launch {
+            try {
+                val resp = withContext(Dispatchers.IO) { ApiClient.api.generatePairing() }
+                wardCodeText.text = resp.pairingCode
+                codeExpiresAt = System.currentTimeMillis() + 5 * 60 * 1000L
+                wardCodeCard.visibility = View.VISIBLE
+                handler.removeCallbacks(countdownRunnable)
+                handler.post(countdownRunnable)
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity,
+                    getString(R.string.error_network), Toast.LENGTH_LONG).show()
+            } finally {
+                wardGenBtn.isEnabled = true
+            }
+        }
+    }
+
+    private fun refreshWardPairingStatus() {
+        scope.launch {
+            try {
+                val status = withContext(Dispatchers.IO) { ApiClient.api.getPairingStatus() }
+                if (status.paired) {
+                    wardPairingStatus.text = getString(R.string.ward_pairing_status_paired)
+                    wardPairingStatus.setTextColor(0xFF388E3C.toInt())
+                    wardGenBtn.visibility = View.GONE
+                    wardCodeCard.visibility = View.GONE
+                } else {
+                    wardPairingStatus.text = getString(R.string.ward_pairing_status_unpaired)
+                    wardPairingStatus.setTextColor(0xFFE53935.toInt())
+                    wardGenBtn.visibility = View.VISIBLE
+                }
+            } catch (_: Exception) { /* 网络失败时保持当前状态 */ }
+        }
+    }
+
+    private fun refreshPermissionStatus() {
+        val locOk = isGranted(Manifest.permission.ACCESS_FINE_LOCATION) ||
+                isGranted(Manifest.permission.ACCESS_COARSE_LOCATION)
+        wardPermLocation.text = if (locOk) getString(R.string.ward_perm_location_ok)
+        else getString(R.string.ward_perm_location_missing)
+        wardPermLocation.setTextColor(if (locOk) 0xFF388E3C.toInt() else 0xFFE53935.toInt())
+
+        val usageOk = UsageMonitor(this).hasUsageStatsPermission()
+        wardPermUsage.text = if (usageOk) getString(R.string.ward_perm_usage_ok)
+        else getString(R.string.ward_perm_usage_missing)
+        wardPermUsage.setTextColor(if (usageOk) 0xFF388E3C.toInt() else 0xFFE53935.toInt())
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // GUARDIAN 屏
+    // ═══════════════════════════════════════════════════════════
+
+    private fun buildGuardianScreen() {
+        // 顶部身份栏
+        rootLinear.addView(identityHeader(
+            getString(R.string.guardian_title),
+            tokenManager.deviceUuid.take(8)
+        ))
+        rootLinear.addView(divider())
+
+        // 配对状态
+        guardianPairingStatus = textView(getString(R.string.ward_pairing_status_unpaired), 15f,
+            color = 0xFFE53935.toInt())
+        rootLinear.addView(sectionLabel("配对状态"))
+        rootLinear.addView(guardianPairingStatus)
+
+        // 未配对：输入配对码区域
+        guardianInputArea = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        guardianCodeInput = EditText(this).apply {
+            hint = getString(R.string.guardian_code_hint)
+            maxLines = 1
+            inputType = InputType.TYPE_CLASS_NUMBER
             textSize = 20f
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(0, 0, 0, 24.dp())
-        })
-
-        // 分隔说明
-        root.addView(label("─── Ward 端操作 ───"))
-
-        // 按钮 1：被监护者生成配对码
-        root.addView(button("[Ward] 生成配对码 & 启动同步") {
-            testGenerateCode()
-        })
-
-        root.addView(label("─── Guardian 端操作 ───"))
-
-        // 配对码输入框
-        codeInput = EditText(this).apply {
-            hint = "输入6位配对码..."
-            maxLines = 1
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
-        root.addView(codeInput)
+        guardianInputArea.addView(guardianCodeInput)
+        guardianInputArea.addView(spacer(dp(8)))
+        guardianInputArea.addView(button(getString(R.string.guardian_btn_confirm)) {
+            val code = guardianCodeInput.text.toString().trim()
+            if (code.length == 6) confirmPairing(code)
+            else Toast.makeText(this, "请输入6位配对码", Toast.LENGTH_SHORT).show()
+        })
+        rootLinear.addView(guardianInputArea)
 
-        // 按钮 2：监护者确认配对码
-        root.addView(button("[Guardian] 确认配对码") {
-            val code = codeInput.text.toString().trim()
-            if (code.length == 6) {
-                testConfirmCode(code)
-            } else {
-                Log.w(TAG, "请先输入6位配对码")
+        // 已配对：被监护者数据卡片
+        guardianDataCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        guardianWardUuid  = textView("", 14f, color = 0xFF555555.toInt())
+        guardianLocation  = textView("", 15f)
+        guardianLastUsed  = textView("", 15f)
+        guardianLastSeen  = textView("", 13f, color = 0xFF888888.toInt())
+        guardianDataCard.addView(guardianWardUuid)
+        guardianDataCard.addView(spacer(dp(4)))
+        guardianDataCard.addView(guardianLocation)
+        guardianDataCard.addView(guardianLastUsed)
+        guardianDataCard.addView(spacer(dp(4)))
+        guardianDataCard.addView(guardianLastSeen)
+        guardianDataCard.addView(spacer(dp(12)))
+        guardianDataCard.addView(button(getString(R.string.guardian_btn_refresh)) { fetchLatestData() })
+        rootLinear.addView(guardianDataCard)
+
+        // 初始查询配对状态
+        refreshGuardianPairingStatus()
+    }
+
+    private fun refreshGuardianPairingStatus() {
+        scope.launch {
+            try {
+                val status = withContext(Dispatchers.IO) { ApiClient.api.getPairingStatus() }
+                if (status.paired) {
+                    guardianPairingStatus.text = getString(R.string.ward_pairing_status_paired)
+                    guardianPairingStatus.setTextColor(0xFF388E3C.toInt())
+                    guardianInputArea.visibility = View.GONE
+                    guardianDataCard.visibility = View.VISIBLE
+                    fetchLatestData()
+                }
+            } catch (_: Exception) { /* 保持未配对状态 */ }
+        }
+    }
+
+    private fun confirmPairing(code: String) {
+        scope.launch {
+            val loadingToast = Toast.makeText(this@MainActivity,
+                getString(R.string.loading), Toast.LENGTH_SHORT)
+            loadingToast.show()
+            try {
+                withContext(Dispatchers.IO) {
+                    ApiClient.api.confirmPairing(ConfirmPairingRequest(code))
+                }
+                loadingToast.cancel()
+                guardianPairingStatus.text = getString(R.string.ward_pairing_status_paired)
+                guardianPairingStatus.setTextColor(0xFF388E3C.toInt())
+                guardianInputArea.visibility = View.GONE
+                guardianDataCard.visibility = View.VISIBLE
+                fetchLatestData()
+            } catch (e: Exception) {
+                loadingToast.cancel()
+                val msg = if (e.message?.contains("422") == true || e.message?.contains("invalid") == true)
+                    "配对码无效或已过期" else getString(R.string.error_network)
+                Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
             }
-        })
-
-        // 按钮 3：监护者拉取被监护者数据
-        root.addView(button("[Guardian] 拉取最新数据") {
-            testFetchData()
-        })
-
-        return ScrollView(this).apply { addView(root) }
+        }
     }
 
-    private fun label(text: String) = TextView(this).apply {
-        this.text = text
-        textSize = 13f
-        setPadding(0, 16.dp(), 0, 8.dp())
-        setTextColor(0xFF888888.toInt())
-    }
-
-    private fun Int.dp() = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, this.toFloat(), resources.displayMetrics
-    ).toInt()
-
-    private fun button(text: String, onClick: () -> Unit) = Button(this).apply {
-        this.text = text
-        setOnClickListener { onClick() }
-        val lp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { setMargins(0, 8.dp(), 0, 0) }
-        layoutParams = lp
-    }
-
-    // ── 设备信息日志 ─────────────────────────────────────────
-
-    private fun logDeviceInfo() {
-        Log.i(TAG, "═══════════════════════════════════════════")
-        Log.i(TAG, "  Device UUID : ${tokenManager.deviceUuid}")
-        Log.i(TAG, "  Device Role : ${tokenManager.deviceRole ?: "未设置"}")
-        Log.i(TAG, "═══════════════════════════════════════════")
+    private fun fetchLatestData() {
+        scope.launch {
+            try {
+                val data = withContext(Dispatchers.IO) { ApiClient.api.getLatestData() }
+                guardianWardUuid.text = "被监护者：${data.wardUuid.take(8)}…"
+                guardianLocation.text = "位置：(${String.format("%.4f", data.latitude)}, " +
+                        "${String.format("%.4f", data.longitude)})"
+                guardianLastUsed.text = "最后使用手机：${
+                    data.lastUsedAt?.let { relativeTime(parseIso(it)) } ?: "暂无记录"
+                }"
+                guardianLastSeen.text = "最后同步：${relativeTime(parseIso(data.lastSeen))}"
+                guardianDataCard.visibility = View.VISIBLE
+            } catch (_: Exception) {
+                Toast.makeText(this@MainActivity,
+                    getString(R.string.error_network), Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     // ── 权限处理 ─────────────────────────────────────────────
 
-    /**
-     * 第一步：申请前台位置权限（Fine + Coarse 合并为一次弹框）。
-     * 已授权时直接推进到后台位置权限检查。
-     */
     private fun requestForegroundLocation() {
-        val needed = FOREGROUND_LOCATION_PERMS.filter { !isGranted(it) }
-        if (needed.isEmpty()) {
-            Log.i(TAG, "前台位置权限已授予")
-            maybeRequestBackgroundLocation()
-        } else {
-            ActivityCompat.requestPermissions(this, needed.toTypedArray(), REQ_FOREGROUND_LOC)
-        }
+        val needed = arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ).filter { !isGranted(it) }
+        if (needed.isEmpty()) maybeRequestBackgroundLocation()
+        else ActivityCompat.requestPermissions(this, needed.toTypedArray(), REQ_FOREGROUND_LOC)
     }
 
-    /**
-     * 第二步：ACCESS_BACKGROUND_LOCATION 必须在前台权限授予后单独申请（Android 10+）。
-     * 低于 API 29 的设备跳过此步骤。
-     */
     private fun maybeRequestBackgroundLocation() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             !isGranted(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
@@ -180,136 +424,135 @@ class MainActivity : Activity() {
                 arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
                 REQ_BACKGROUND_LOC
             )
-        } else {
-            Log.i(TAG, "后台位置权限已授予（或系统版本 < API 29）")
         }
     }
 
-    /**
-     * PACKAGE_USAGE_STATS 属于 AppOps 特殊权限，无法通过 requestPermissions 弹框申请。
-     * 若未授权，跳转系统「有权查看使用情况的应用」设置页，引导用户手动开启。
-     */
-    private fun checkUsageStatsPermission() {
-        if (UsageMonitor(this).hasUsageStatsPermission()) {
-            Log.i(TAG, "PACKAGE_USAGE_STATS：已授权")
-        } else {
-            Log.w(TAG, "PACKAGE_USAGE_STATS 未授权 → 跳转系统设置，请手动开启本应用的使用情况访问权限")
-            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+    private fun maybeRequestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !isGranted(Manifest.permission.POST_NOTIFICATIONS)
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                REQ_NOTIFICATION
+            )
         }
     }
 
     override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray
+        requestCode: Int, permissions: Array<String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         when (requestCode) {
             REQ_FOREGROUND_LOC -> {
-                val allGranted = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
-                Log.i(TAG, "前台位置权限：${if (allGranted) "已授予" else "被拒绝"}")
-                if (allGranted) maybeRequestBackgroundLocation()
+                if (grantResults.all { it == PackageManager.PERMISSION_GRANTED })
+                    maybeRequestBackgroundLocation()
+                if (::wardPermLocation.isInitialized) refreshPermissionStatus()
             }
             REQ_BACKGROUND_LOC -> {
-                val granted = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
-                Log.i(TAG, "后台位置权限（ACCESS_BACKGROUND_LOCATION）：${if (granted) "已授予" else "被拒绝"}")
+                if (::wardPermLocation.isInitialized) refreshPermissionStatus()
             }
         }
     }
 
-    private fun isGranted(permission: String) =
-        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+    private fun isGranted(p: String) =
+        ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
 
-    // ── 测试函数 ─────────────────────────────────────────────
+    // ── 时间工具 ─────────────────────────────────────────────
 
-    /**
-     * 扮演**被监护者**：
-     *  1. 向服务器注册设备（角色 = ward）
-     *  2. 请求生成6位配对码并打印
-     *  3. 启动 [DataSyncWorker] 周期性后台上报
-     *
-     * 查看 Logcat TAG=MainActivity，找到带 ✅ 的行获取配对码。
-     */
-    fun testGenerateCode() = scope.launch {
-        val uuid = tokenManager.deviceUuid
-        Log.i(TAG, "▶ testGenerateCode  uuid=$uuid")
-        runCatching {
-            // 注册/更新角色为 ward
-            ApiClient.api.registerDevice(RegisterRequest(uuid, DeviceRole.WARD.value))
-            tokenManager.deviceRole = DeviceRole.WARD
-            Log.i(TAG, "  设备已注册为 WARD")
+    private fun parseIso(iso: String): Long = try {
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+            .apply { timeZone = TimeZone.getTimeZone("UTC") }
+            .parse(iso)?.time ?: System.currentTimeMillis()
+    } catch (_: Exception) { System.currentTimeMillis() }
 
-            // 请求配对码
-            val resp = ApiClient.api.generatePairing(GeneratePairingRequest(uuid))
-            Log.i(TAG, "  ✅ 配对码：${resp.pairingCode}  (有效至 ${resp.expiresAt})")
-
-            // 启动后台同步
-            DataSyncWorker.schedule(this@MainActivity)
-            Log.i(TAG, "  DataSyncWorker 已调度（每15分钟执行一次）")
-        }.onFailure { e ->
-            Log.e(TAG, "  ❌ testGenerateCode 失败：${e.message}")
+    private fun relativeTime(epochMs: Long): String {
+        val diffMin = abs(System.currentTimeMillis() - epochMs) / 60_000
+        return when {
+            diffMin < 1    -> getString(R.string.time_just_now)
+            diffMin < 60   -> getString(R.string.time_minutes_ago, diffMin)
+            diffMin < 1440 -> getString(R.string.time_hours_ago, diffMin / 60)
+            else -> SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(epochMs))
         }
     }
 
-    /**
-     * 扮演**监护者**：
-     *  1. 向服务器注册设备（角色 = guardian）
-     *  2. 用 [code] 调用 `/pair/confirm` 完成双向绑定
-     *  3. 打印绑定结果（guardian_id、ward_id）
-     *
-     * @param code 从被监护者设备 Logcat 复制的6位配对码
-     */
-    fun testConfirmCode(code: String) = scope.launch {
-        val uuid = tokenManager.deviceUuid
-        Log.i(TAG, "▶ testConfirmCode  uuid=$uuid  code=$code")
-        runCatching {
-            // 注册/更新角色为 guardian
-            ApiClient.api.registerDevice(RegisterRequest(uuid, DeviceRole.GUARDIAN.value))
-            tokenManager.deviceRole = DeviceRole.GUARDIAN
-            Log.i(TAG, "  设备已注册为 GUARDIAN")
+    // ── 可复用 View 工厂 ─────────────────────────────────────
 
-            // 确认配对
-            val binding = ApiClient.api.confirmPairing(ConfirmPairingRequest(uuid, code))
-            Log.i(TAG, "  ✅ 配对成功！")
-            Log.i(TAG, "  Guardian ID : ${binding.guardianId}")
-            Log.i(TAG, "  Ward ID     : ${binding.wardId}")
-            Log.i(TAG, "  绑定时间    : ${binding.createdAt}")
-        }.onFailure { e ->
-            Log.e(TAG, "  ❌ testConfirmCode 失败：${e.message}")
+    private fun identityHeader(role: String, shortUuid: String): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(textView(role, 22f, bold = true).apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(textView(shortUuid, 12f, color = 0xFF888888.toInt()))
         }
+
+    private fun sectionLabel(text: String): TextView = textView(text, 12f,
+        color = 0xFF888888.toInt()).apply { setPadding(0, dp(16), 0, dp(4)) }
+
+    private fun divider(): View = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+            .also { it.setMargins(0, dp(16), 0, dp(8)) }
+        setBackgroundColor(0xFFDDDDDD.toInt())
     }
 
-    /**
-     * 扮演**监护者**：
-     *  调用 `/data/latest` 拉取被监护者的最新位置和手机最后使用时间，并打印。
-     *
-     * 前置条件：本机已完成配对（即先执行过 [testConfirmCode]）。
-     */
-    fun testFetchData() = scope.launch {
-        val uuid = tokenManager.deviceUuid
-        Log.i(TAG, "▶ testFetchData  guardianUuid=$uuid")
-        runCatching {
-            val data = ApiClient.api.getLatestData(uuid)
-            Log.i(TAG, "  ✅ 被监护者最新数据：")
-            Log.i(TAG, "  Ward UUID    : ${data.wardUuid}")
-            Log.i(TAG, "  位置         : (${data.latitude}, ${data.longitude})")
-            Log.i(TAG, "  服务端最后收到: ${data.lastSeen}")
-            Log.i(TAG, "  手机最后使用  : ${data.lastUsedAt ?: "暂无记录"}")
-        }.onFailure { e ->
-            Log.e(TAG, "  ❌ testFetchData 失败：${e.message}")
-        }
+    private fun spacer(height: Int): View = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height)
     }
+
+    private fun textView(
+        text: String, sizeSp: Float, bold: Boolean = false,
+        color: Int = 0xFF212121.toInt(), gravity: Int = Gravity.NO_GRAVITY
+    ) = TextView(this).apply {
+        this.text = text
+        textSize = sizeSp
+        this.gravity = gravity
+        setTextColor(color)
+        if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+    }
+
+    private fun button(text: String, onClick: () -> Unit) = Button(this).apply {
+        this.text = text
+        setOnClickListener { onClick() }
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).also { it.setMargins(0, dp(4), 0, dp(4)) }
+    }
+
+    private fun bigButton(text: String, bgColor: Int, onClick: () -> Unit) = Button(this).apply {
+        this.text = text
+        textSize = 18f
+        setTextColor(0xFFFFFFFF.toInt())
+        setBackgroundColor(bgColor)
+        setOnClickListener { onClick() }
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(56)
+        ).also { it.setMargins(0, dp(4), 0, dp(4)) }
+    }
+
+    private fun clickableText(text: String, onClick: () -> Unit) = TextView(this).apply {
+        this.text = text
+        textSize = 14f
+        setPadding(0, dp(4), 0, dp(4))
+        setOnClickListener { onClick() }
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+    }
+
+    private fun dp(value: Int) = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics
+    ).toInt()
 
     // ── 常量 ─────────────────────────────────────────────────
 
     companion object {
-        private const val TAG = "MainActivity"
         private const val REQ_FOREGROUND_LOC = 1001
         private const val REQ_BACKGROUND_LOC = 1002
-
-        private val FOREGROUND_LOCATION_PERMS = arrayOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
+        private const val REQ_NOTIFICATION   = 1003
     }
 }

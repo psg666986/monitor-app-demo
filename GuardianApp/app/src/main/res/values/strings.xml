@@ -1,4 +1,40 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">GuardianApp</string>
+    <string name="app_name">Guardian 守护</string>
+
+    <!-- 角色选择屏 -->
+    <string name="role_select_title">Guardian 守护</string>
+    <string name="role_select_subtitle">请选择您的角色</string>
+    <string name="role_guardian">我是监护者</string>
+    <string name="role_ward">我是被监护者</string>
+
+    <!-- Ward 屏 -->
+    <string name="ward_title">被监护者</string>
+    <string name="ward_pairing_status_unpaired">未配对</string>
+    <string name="ward_pairing_status_paired">已配对 ✓</string>
+    <string name="ward_btn_generate_code">生成配对码</string>
+    <string name="ward_code_hint">将此码告知监护者</string>
+    <string name="ward_code_expires">有效期剩余 %d 秒</string>
+    <string name="ward_sync_never">从未同步</string>
+    <string name="ward_perm_location_ok">位置权限：已授权 ✓</string>
+    <string name="ward_perm_location_missing">位置权限：未授权（点此授权）</string>
+    <string name="ward_perm_usage_ok">使用统计权限：已授权 ✓</string>
+    <string name="ward_perm_usage_missing">使用统计权限：未授权（点此前往设置）</string>
+
+    <!-- Guardian 屏 -->
+    <string name="guardian_title">监护者</string>
+    <string name="guardian_code_hint">输入被监护者的 6 位配对码</string>
+    <string name="guardian_btn_confirm">确认配对</string>
+    <string name="guardian_btn_refresh">刷新数据</string>
+    <string name="guardian_no_data">暂无数据，请稍后刷新</string>
+
+    <!-- 通用 -->
+    <string name="loading">正在处理…</string>
+    <string name="error_network">网络错误，请重试</string>
+    <string name="error_server">服务器错误，请稍后重试</string>
+
+    <!-- 相对时间 -->
+    <string name="time_just_now">刚刚</string>
+    <string name="time_minutes_ago">%d 分钟前</string>
+    <string name="time_hours_ago">%d 小时前</string>
 </resources>
