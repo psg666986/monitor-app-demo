@@ -9,6 +9,7 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -69,7 +70,10 @@ class LocationTracker(private val context: Context) {
                        else             Priority.PRIORITY_BALANCED_POWER_ACCURACY
 
         return try {
-            val location = fetchCurrentLocation(priority) ?: fetchLastKnownLocation()
+            // getCurrentLocation 冷启动可能耗时较长；超过 20 秒则直接回退到缓存位置，
+            // 避免 WorkManager 认为 Worker 卡死而强杀任务
+            val current = withTimeoutOrNull(20_000L) { fetchCurrentLocation(priority) }
+            val location = current ?: fetchLastKnownLocation()
             if (location != null) Result.Success(location.latitude, location.longitude)
             else Result.Unavailable
         } catch (_: SecurityException) {

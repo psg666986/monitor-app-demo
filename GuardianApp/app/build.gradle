@@ -73,6 +73,9 @@ dependencies {
     // AndroidX Core（提供 ContextCompat 等工具）
     implementation 'androidx.core:core-ktx:1.13.1'
 
+    // 加密存储（保护 JWT token 和设备 UUID）
+    implementation 'androidx.security:security-crypto:1.0.0'
+
     // WorkManager（后台周期性任务，提供 CoroutineWorker）
     implementation 'androidx.work:work-runtime-ktx:2.9.0'
 

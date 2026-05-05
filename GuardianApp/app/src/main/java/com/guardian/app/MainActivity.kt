@@ -2,6 +2,7 @@ package com.guardian.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -44,6 +45,8 @@ import kotlin.math.abs
  *  - [Screen.ROLE_SELECT]  首次启动，选择角色并完成设备注册
  *  - [Screen.WARD]         被监护者视图：生成/展示配对码、同步状态、权限状态
  *  - [Screen.GUARDIAN]     监护者视图：输入配对码、查看被监护者数据
+ *
+ * `configChanges="orientation|screenSize|keyboardHidden"` 防止旋转触发 Activity 重建。
  */
 class MainActivity : Activity() {
 
@@ -59,12 +62,13 @@ class MainActivity : Activity() {
 
     // ── Ward 屏动态组件 ───────────────────────────────────────
     private lateinit var wardPairingStatus: TextView
-    private lateinit var wardCodeCard: LinearLayout    // 配对码大字 + 倒计时（可见/隐藏）
+    private lateinit var wardCodeCard: LinearLayout
     private lateinit var wardCodeText: TextView
     private lateinit var wardCodeExpiry: TextView
     private lateinit var wardGenBtn: Button
     private lateinit var wardPermLocation: TextView
     private lateinit var wardPermUsage: TextView
+    private lateinit var wardSyncText: TextView
 
     private var codeExpiresAt: Long = 0L
     private val countdownRunnable = object : Runnable {
@@ -78,9 +82,9 @@ class MainActivity : Activity() {
 
     // ── Guardian 屏动态组件 ───────────────────────────────────
     private lateinit var guardianPairingStatus: TextView
-    private lateinit var guardianInputArea: LinearLayout   // 未配对时展示
+    private lateinit var guardianInputArea: LinearLayout
     private lateinit var guardianCodeInput: EditText
-    private lateinit var guardianDataCard: LinearLayout    // 已配对时展示
+    private lateinit var guardianDataCard: LinearLayout
     private lateinit var guardianWardUuid: TextView
     private lateinit var guardianLocation: TextView
     private lateinit var guardianLastUsed: TextView
@@ -97,7 +101,13 @@ class MainActivity : Activity() {
         rootScroll = ScrollView(this).apply { addView(rootLinear) }
         setContentView(rootScroll)
 
-        // 根据已保存角色决定展示哪个屏
+        // token 过期时强制重置，防止使用过期凭证静默失败
+        if (tokenManager.hasRole() && tokenManager.isTokenExpired()) {
+            Toast.makeText(this, getString(R.string.error_token_expired), Toast.LENGTH_LONG).show()
+            performReset()
+            return
+        }
+
         when (tokenManager.deviceRole) {
             DeviceRole.WARD     -> showScreen(Screen.WARD)
             DeviceRole.GUARDIAN -> showScreen(Screen.GUARDIAN)
@@ -107,13 +117,13 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // 必须在 Activity 销毁时移除 Runnable，防止 Handler 持有已销毁的 View 引用
         handler.removeCallbacks(countdownRunnable)
         scope.cancel()
     }
 
     override fun onResume() {
         super.onResume()
-        // 每次回到前台刷新权限状态显示
         if (tokenManager.deviceRole == DeviceRole.WARD && ::wardPermLocation.isInitialized) {
             refreshPermissionStatus()
         }
@@ -187,7 +197,6 @@ class MainActivity : Activity() {
     // ═══════════════════════════════════════════════════════════
 
     private fun buildWardScreen() {
-        // 顶部身份栏
         rootLinear.addView(identityHeader(
             getString(R.string.ward_title),
             tokenManager.deviceUuid.take(8)
@@ -218,9 +227,17 @@ class MainActivity : Activity() {
         rootLinear.addView(wardCodeCard)
         rootLinear.addView(spacer(dp(8)))
 
-        // 生成配对码按钮
         wardGenBtn = button(getString(R.string.ward_btn_generate_code)) { generatePairingCode() }
         rootLinear.addView(wardGenBtn)
+        rootLinear.addView(divider())
+
+        // 同步状态
+        rootLinear.addView(sectionLabel(getString(R.string.ward_section_sync)))
+        val lastSync = tokenManager.lastSyncTime
+        val syncText = if (lastSync == 0L) getString(R.string.ward_sync_never)
+                       else getString(R.string.ward_last_sync, relativeTime(lastSync))
+        wardSyncText = textView(syncText, 14f, color = 0xFF555555.toInt())
+        rootLinear.addView(wardSyncText)
         rootLinear.addView(divider())
 
         // 权限状态
@@ -232,7 +249,12 @@ class MainActivity : Activity() {
         rootLinear.addView(wardPermLocation)
         rootLinear.addView(wardPermUsage)
 
-        // 初始化状态
+        // 解绑 / 登出
+        rootLinear.addView(divider())
+        rootLinear.addView(button(getString(R.string.action_unbind)) { unbindDevice() })
+        rootLinear.addView(spacer(dp(4)))
+        rootLinear.addView(button(getString(R.string.action_logout)) { confirmLogout() })
+
         refreshPermissionStatus()
         refreshWardPairingStatus()
     }
@@ -292,14 +314,12 @@ class MainActivity : Activity() {
     // ═══════════════════════════════════════════════════════════
 
     private fun buildGuardianScreen() {
-        // 顶部身份栏
         rootLinear.addView(identityHeader(
             getString(R.string.guardian_title),
             tokenManager.deviceUuid.take(8)
         ))
         rootLinear.addView(divider())
 
-        // 配对状态
         guardianPairingStatus = textView(getString(R.string.ward_pairing_status_unpaired), 15f,
             color = 0xFFE53935.toInt())
         rootLinear.addView(sectionLabel("配对状态"))
@@ -319,7 +339,7 @@ class MainActivity : Activity() {
         guardianInputArea.addView(button(getString(R.string.guardian_btn_confirm)) {
             val code = guardianCodeInput.text.toString().trim()
             if (code.length == 6) confirmPairing(code)
-            else Toast.makeText(this, "请输入6位配对码", Toast.LENGTH_SHORT).show()
+            else Toast.makeText(this, getString(R.string.error_pair_invalid), Toast.LENGTH_SHORT).show()
         })
         rootLinear.addView(guardianInputArea)
 
@@ -342,7 +362,12 @@ class MainActivity : Activity() {
         guardianDataCard.addView(button(getString(R.string.guardian_btn_refresh)) { fetchLatestData() })
         rootLinear.addView(guardianDataCard)
 
-        // 初始查询配对状态
+        // 解绑 / 登出
+        rootLinear.addView(divider())
+        rootLinear.addView(button(getString(R.string.action_unbind)) { unbindDevice() })
+        rootLinear.addView(spacer(dp(4)))
+        rootLinear.addView(button(getString(R.string.action_logout)) { confirmLogout() })
+
         refreshGuardianPairingStatus()
     }
 
@@ -378,8 +403,11 @@ class MainActivity : Activity() {
                 fetchLatestData()
             } catch (e: Exception) {
                 loadingToast.cancel()
-                val msg = if (e.message?.contains("422") == true || e.message?.contains("invalid") == true)
-                    "配对码无效或已过期" else getString(R.string.error_network)
+                val msg = if (e.message?.contains("422") == true ||
+                              e.message?.contains("invalid") == true ||
+                              e.message?.contains("expired") == true)
+                    getString(R.string.error_pair_invalid)
+                else getString(R.string.error_network)
                 Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
             }
         }
@@ -402,6 +430,51 @@ class MainActivity : Activity() {
                     getString(R.string.error_network), Toast.LENGTH_SHORT).show()
             }
         }
+    }
+
+    // ── 解绑 / 登出 ───────────────────────────────────────────
+
+    /**
+     * 解除配对关系：调用服务端 DELETE /pair/binding，成功后刷新当前屏幕回到未配对状态。
+     * 设备身份（UUID / role / token）保留，可重新配对。
+     */
+    private fun unbindDevice() {
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { ApiClient.api.unbindPairing() }
+                Toast.makeText(this@MainActivity,
+                    getString(R.string.unbind_success), Toast.LENGTH_SHORT).show()
+                // 刷新当前屏回到未配对状态
+                when (tokenManager.deviceRole) {
+                    DeviceRole.WARD     -> showScreen(Screen.WARD)
+                    DeviceRole.GUARDIAN -> showScreen(Screen.GUARDIAN)
+                    null -> {}
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity,
+                    getString(R.string.error_network), Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    /**
+     * 弹出确认对话框后执行完整重置（清除所有本地数据 + 取消后台 Worker）。
+     */
+    private fun confirmLogout() {
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.action_logout))
+            .setMessage(getString(R.string.action_logout_confirm))
+            .setPositiveButton("确认") { _, _ -> performReset() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun performReset() {
+        handler.removeCallbacks(countdownRunnable)
+        DataSyncWorker.cancel(this)
+        GuardianPollWorker.cancel(this)
+        tokenManager.clear()
+        showScreen(Screen.ROLE_SELECT)
     }
 
     // ── 权限处理 ─────────────────────────────────────────────
@@ -461,10 +534,19 @@ class MainActivity : Activity() {
     // ── 时间工具 ─────────────────────────────────────────────
 
     private fun parseIso(iso: String): Long = try {
-        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
-            .apply { timeZone = TimeZone.getTimeZone("UTC") }
-            .parse(iso)?.time ?: System.currentTimeMillis()
-    } catch (_: Exception) { System.currentTimeMillis() }
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssX", Locale.US)
+            .parse(iso)?.time
+            ?: SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+                .apply { timeZone = TimeZone.getTimeZone("UTC") }
+                .parse(iso)?.time
+            ?: System.currentTimeMillis()
+    } catch (_: Exception) {
+        try {
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+                .apply { timeZone = TimeZone.getTimeZone("UTC") }
+                .parse(iso)?.time ?: System.currentTimeMillis()
+        } catch (_: Exception) { System.currentTimeMillis() }
+    }
 
     private fun relativeTime(epochMs: Long): String {
         val diffMin = abs(System.currentTimeMillis() - epochMs) / 60_000

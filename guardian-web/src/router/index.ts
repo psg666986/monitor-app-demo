@@ -1,5 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { getToken } from '@/utils/storage'
+import { getToken, isTokenExpired, clearAuth } from '@/utils/storage'
 import SetupView from '@/views/SetupView.vue'
 import DashboardView from '@/views/DashboardView.vue'
 
@@ -20,10 +20,13 @@ const router = createRouter({
   ],
 })
 
-// 导航守卫：未登录时强制跳到 /setup
+// 导航守卫：未登录或 token 过期时强制跳到 /setup
 router.beforeEach((to) => {
-  if (to.meta.requiresAuth && !getToken()) {
-    return '/setup'
+  if (to.meta.requiresAuth) {
+    if (!getToken() || isTokenExpired()) {
+      clearAuth()
+      return '/setup'
+    }
   }
 })
 

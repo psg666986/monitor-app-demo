@@ -100,6 +100,8 @@ class DataSyncWorker(
                     lastUsedAt = lastUsedAtIso
                 )
             )
+            // 记录最后一次成功同步时间（Ward 主界面用于显示"上次同步：X 分钟前"）
+            tokenManager.lastSyncTime = System.currentTimeMillis()
             Log.i(TAG, "Sync OK — uuid=$uuid lat=$latitude lng=$longitude lastUsed=$lastUsedAtIso")
             Result.success()
 

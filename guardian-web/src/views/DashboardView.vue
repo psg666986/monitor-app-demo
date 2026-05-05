@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted, shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, type DataLatestResponse } from '@/api/client'
 import { wgs84ToGcj02 } from '@/utils/coords'
-import { clearAuth } from '@/utils/storage'
+import { clearAll } from '@/utils/storage'
 
 // 高德地图类型别名（用类型转换代替 declare，避免在 script setup 中使用 ambient declarations）
 type AMapWindow = Window & { AMap?: any; [key: string]: any }
@@ -16,6 +16,7 @@ const marker         = shallowRef<any>(null)
 const wardData       = ref<DataLatestResponse | null>(null)
 const errorMsg       = ref('')
 const isRefreshing   = ref(false)
+const isUnbinding    = ref(false)
 const lastRefreshed  = ref<Date | null>(null)
 const amapReady      = ref(false)
 
@@ -62,10 +63,10 @@ async function initMap() {
   if (!AMap || !mapEl.value) return
 
   map.value = new AMap.Map(mapEl.value, {
-    zoom:         15,
-    center:       [116.397428, 39.90923],
+    zoom:         12,
     mapStyle:     'amap://styles/normal',
     resizeEnable: true,
+    // 不设置初始 center，等待第一次数据加载后再定位到 ward 位置
   })
   amapReady.value = true
 }
@@ -117,8 +118,23 @@ async function refresh() {
 }
 
 function logout() {
-  clearAuth()
+  clearAll()
   router.replace('/setup')
+}
+
+async function unbind() {
+  if (!confirm('确认解除配对？解绑后被监护者需重新生成配对码。')) return
+  isUnbinding.value = true
+  try {
+    await api.unbindPairing()
+    // 解绑成功：清除所有本地数据，回到注册页重新配对
+    clearAll()
+    router.replace('/setup')
+  } catch {
+    errorMsg.value = '解除配对失败，请重试'
+  } finally {
+    isUnbinding.value = false
+  }
 }
 
 // ── 计算属性 ──────────────────────────────────────────────
@@ -195,6 +211,9 @@ function statusText(lastSeen: string): string {
           <span v-if="isRefreshing" class="spin-sm" />
           <template v-else>↻</template>
           {{ isRefreshing ? '刷新中' : '刷新' }}
+        </button>
+        <button class="btn-header btn-unbind" :disabled="isUnbinding" @click="unbind">
+          {{ isUnbinding ? '解绑中…' : '解除配对' }}
         </button>
         <button class="btn-header btn-logout" @click="logout">退出</button>
       </div>
@@ -315,6 +334,8 @@ function statusText(lastSeen: string): string {
 
 .btn-header:hover:not(:disabled) { background: rgba(255,255,255,0.25); }
 .btn-header:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn-unbind { background: rgba(245,124,0,0.25); border-color: rgba(245,124,0,0.4); }
+.btn-unbind:hover:not(:disabled) { background: rgba(245,124,0,0.45) !important; }
 .btn-logout { background: rgba(229,57,53,0.3); border-color: rgba(229,57,53,0.4); }
 .btn-logout:hover { background: rgba(229,57,53,0.5) !important; }
 

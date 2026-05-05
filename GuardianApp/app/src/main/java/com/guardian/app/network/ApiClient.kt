@@ -107,7 +107,15 @@ interface GuardianApi {
     /** 监护者拉取被监护者最新状态（guardian UUID 从 JWT 获取） */
     @GET("data/latest")
     suspend fun getLatestData(): DataLatestResponse
+
+    /** 任意一方解除配对关系（UUID 从 JWT 获取，幂等） */
+    @DELETE("pair/binding")
+    suspend fun unbindPairing(): MessageResponse
 }
+
+data class MessageResponse(
+    @SerializedName("message") val message: String
+)
 
 // ─────────────────────────────────────────────────────────────
 // Retrofit 单例

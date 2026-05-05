@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { getToken, clearAuth } from '@/utils/storage'
+import { getToken, clearAuth, isTokenExpired } from '@/utils/storage'
 import router from '@/router'
 
 // 开发环境：baseURL = '/api'，由 vite.config.ts proxy 转发到后端
@@ -9,14 +9,21 @@ const client = axios.create({
   timeout: 15_000,
 })
 
-// 请求拦截：自动附加 Bearer token
+// 请求拦截：自动附加 Bearer token；发请求前检测 token 是否已过期
 client.interceptors.request.use((config) => {
   const token = getToken()
-  if (token) config.headers.Authorization = `Bearer ${token}`
+  if (!token) return config
+  if (isTokenExpired()) {
+    // token 已过期，清除并跳转重新注册（不发出请求）
+    clearAuth()
+    router.replace('/setup')
+    return Promise.reject(new Error('token expired'))
+  }
+  config.headers.Authorization = `Bearer ${token}`
   return config
 })
 
-// 响应拦截：token 失效时自动跳转到 /setup
+// 响应拦截：服务端 401 时自动清除并跳转
 client.interceptors.response.use(
   (res) => res,
   (err) => {
@@ -63,6 +70,10 @@ export interface DataLatestResponse {
   last_used_at: string | null
 }
 
+export interface MessageResponse {
+  message: string
+}
+
 // ── API 调用 ──────────────────────────────────────────────
 
 export const api = {
@@ -84,6 +95,11 @@ export const api = {
   /** 获取被监护者最新位置和使用状态 */
   getLatestData() {
     return client.get<DataLatestResponse>('/data/latest')
+  },
+
+  /** 解除配对关系（任意一方均可调用，幂等） */
+  unbindPairing() {
+    return client.delete<MessageResponse>('/pair/binding')
   },
 }
 

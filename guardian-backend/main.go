@@ -81,11 +81,37 @@ func generateToken(uuid string, role Role) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(jwtSecret)
 }
 
-// corsMiddleware 允许前端跨域访问（开发环境 Vite dev server / 生产环境独立部署）
+// corsMiddleware 精确匹配 ALLOWED_ORIGINS 环境变量（逗号分隔）；
+// 未设置时默认允许 localhost 常用端口（仅限开发）。
+// 生产部署务必设置 ALLOWED_ORIGINS=https://your-domain.com
 func corsMiddleware() gin.HandlerFunc {
+	raw := os.Getenv("ALLOWED_ORIGINS")
+	allowed := map[string]bool{}
+	if raw != "" {
+		for _, o := range strings.Split(raw, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				allowed[o] = true
+			}
+		}
+	} else {
+		// 开发默认：Vite dev server 和常用本地端口
+		for _, o := range []string{
+			"http://localhost:5173",
+			"http://localhost:3000",
+			"http://127.0.0.1:5173",
+			"http://127.0.0.1:3000",
+		} {
+			allowed[o] = true
+		}
+	}
+
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		origin := c.Request.Header.Get("Origin")
+		if allowed[origin] {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Vary", "Origin")
+		}
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -161,6 +187,9 @@ func initDB(db *sql.DB) error {
 			ward_id    TEXT NOT NULL UNIQUE,
 			expires_at TEXT NOT NULL
 		)`,
+		// 索引：按 guardian_id / ward_id 单独查询 bindings（避免全表扫描）
+		`CREATE INDEX IF NOT EXISTS idx_bindings_guardian ON bindings(guardian_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_bindings_ward     ON bindings(ward_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -300,6 +329,21 @@ func (s *Store) CreateBinding(guardianID, wardID string) (*Binding, error) {
 		return nil, err
 	}
 	return &Binding{GuardianID: guardianID, WardID: wardID, CreatedAt: now}, nil
+}
+
+// DeleteBinding 解除指定设备（guardian 或 ward）的配对关系
+func (s *Store) DeleteBinding(uuid string) error {
+	res, err := s.db.Exec(
+		`DELETE FROM bindings WHERE guardian_id = ? OR ward_id = ?`, uuid, uuid,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no binding found")
+	}
+	return nil
 }
 
 // GetBinding 通过 guardian 或 ward 的 UUID 查询绑定关系
@@ -541,6 +585,24 @@ func dataUpdate(store *Store) gin.HandlerFunc {
 	}
 }
 
+// DELETE /pair/binding（受保护，guardian 或 ward 均可调用）
+// 双方任意一方都可发起解绑；另一方下次请求 /pair/status 会收到 paired:false
+func unbindPairing(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		uuid := c.GetString("uuid")
+		if err := store.DeleteBinding(uuid); err != nil {
+			// "no binding found" 视为幂等成功，避免重复请求返回 500
+			if strings.Contains(err.Error(), "no binding found") {
+				c.JSON(http.StatusOK, gin.H{"message": "already unbound"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove binding"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "unbound"})
+	}
+}
+
 // GET /data/latest（受保护，仅 guardian 调用）
 // guardianUUID 从 JWT claims 获取
 func dataLatest(store *Store) gin.HandlerFunc {
@@ -627,6 +689,16 @@ func main() {
 	r := gin.Default()
 	r.Use(corsMiddleware())
 
+	// 健康检查（负载均衡 / uptime 监控使用，无需认证）
+	r.GET("/healthz", func(c *gin.Context) {
+		// 简单 ping DB 确认可用
+		if err := db.Ping(); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "db_error"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "pong"})
 	})
@@ -644,6 +716,8 @@ func main() {
 			// /confirm 施加 per-IP 限速，防止暴力穷举 6 位配对码
 			pair.POST("/confirm", rateLimitMiddleware(), confirmPairing(store))
 			pair.GET("/status", pairingStatus(store))
+			// 任意一方均可发起解绑
+			pair.DELETE("/binding", unbindPairing(store))
 		}
 
 		data := auth.Group("/data")

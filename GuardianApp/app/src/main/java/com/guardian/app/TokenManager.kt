@@ -2,6 +2,10 @@ package com.guardian.app
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Base64
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import org.json.JSONObject
 import java.util.UUID
 
 /**
@@ -20,34 +24,41 @@ enum class DeviceRole(val value: String) {
 }
 
 /**
- * 本地持久化管理器（SharedPreferences 封装）。
+ * 本地持久化管理器。
  *
- * 职责：
- *  1. 懒生成并缓存本机设备 UUID —— 首次访问时写入，此后只读，保证全生命周期唯一。
- *  2. 持久化设备角色（[DeviceRole.GUARDIAN] / [DeviceRole.WARD]）。
+ * 敏感数据（UUID、JWT token、角色）存储于 [EncryptedSharedPreferences]，
+ * 由系统 KeyStore 的 AES-256-GCM 主密钥加密，root 用户仍无法直接读取明文。
  *
- * 用法示例：
- * ```kotlin
- * val tm = TokenManager(context)
- * val uuid = tm.deviceUuid            // 始终非空
- * tm.deviceRole = DeviceRole.WARD     // 持久化角色选择
- * if (tm.hasRole()) { ... }
- * ```
- *
- * 注意：请使用 `context.applicationContext` 传入，避免 Activity 内存泄漏。
+ * 非敏感元数据（同步时间戳）存储于普通 SharedPreferences（性能较好，内容不涉及隐私）。
  */
 class TokenManager(context: Context) {
 
-    private val prefs: SharedPreferences =
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val ctx = context.applicationContext
+
+    // ── 加密存储（敏感数据）──────────────────────────────────
+
+    private val prefs: SharedPreferences by lazy {
+        val masterKey = MasterKey.Builder(ctx)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        EncryptedSharedPreferences.create(
+            ctx,
+            PREFS_NAME,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+
+    // ── 非敏感元数据存储（同步时间戳等）──────────────────────
+
+    private val metaPrefs: SharedPreferences =
+        ctx.getSharedPreferences(META_PREFS_NAME, Context.MODE_PRIVATE)
 
     // ── UUID ──────────────────────────────────────────────────
 
     /**
-     * 本机设备唯一标识符。
-     * 首次访问时自动生成（crypto-random UUID v4）并写入 SharedPreferences，
-     * 后续访问直接读取缓存值，不再重新生成。
+     * 本机设备唯一标识符（UUID v4，懒生成并永久持久化）。
      */
     val deviceUuid: String
         get() {
@@ -60,54 +71,66 @@ class TokenManager(context: Context) {
 
     // ── 角色 ──────────────────────────────────────────────────
 
-    /**
-     * 当前设备角色；尚未选择时为 null。
-     * 写入后立即持久化（apply() 异步提交）。
-     */
     var deviceRole: DeviceRole?
         get() = prefs.getString(KEY_ROLE, null)?.let { DeviceRole.fromValue(it) }
-        set(value) {
-            prefs.edit().putString(KEY_ROLE, value?.value).apply()
-        }
-
-    // ── 状态查询 ──────────────────────────────────────────────
-
-    /** 是否已完成角色选择 */
-    fun hasRole(): Boolean = prefs.contains(KEY_ROLE)
-
-    /** 当前角色是否为监护者 */
-    fun isGuardian(): Boolean = deviceRole == DeviceRole.GUARDIAN
-
-    /** 当前角色是否为被监护者 */
-    fun isWard(): Boolean = deviceRole == DeviceRole.WARD
-
-    // ── 重置 ──────────────────────────────────────────────────
+        set(value) { prefs.edit().putString(KEY_ROLE, value?.value).apply() }
 
     // ── JWT Token ─────────────────────────────────────────────
 
-    /**
-     * 服务端注册成功后下发的 JWT token。
-     * 所有受保护接口的请求头 `Authorization: Bearer <token>` 均来自此字段。
-     * 未完成注册时为 null，ApiClient 会跳过添加 header。
-     */
     var authToken: String?
         get() = prefs.getString(KEY_TOKEN, null)
         set(value) { prefs.edit().putString(KEY_TOKEN, value).apply() }
 
+    // ── 非敏感元数据 ──────────────────────────────────────────
+
+    /**
+     * Ward 最后一次成功同步到服务器的 Unix 时间戳（毫秒）。
+     * 由 DataSyncWorker 在成功上报后写入；主界面用于展示"上次同步：X 分钟前"。
+     */
+    var lastSyncTime: Long
+        get() = metaPrefs.getLong(KEY_LAST_SYNC, 0L)
+        set(value) { metaPrefs.edit().putLong(KEY_LAST_SYNC, value).apply() }
+
+    // ── 状态查询 ──────────────────────────────────────────────
+
+    fun hasRole(): Boolean = prefs.contains(KEY_ROLE)
+    fun isGuardian(): Boolean = deviceRole == DeviceRole.GUARDIAN
+    fun isWard(): Boolean = deviceRole == DeviceRole.WARD
+
+    /**
+     * 解码 JWT payload 并检查 `exp` 字段是否已过当前时间。
+     * 无 token 或解码失败均视为已过期，触发重新注册流程。
+     */
+    fun isTokenExpired(): Boolean {
+        val token = authToken ?: return true
+        return try {
+            val payloadB64 = token.split(".").getOrNull(1) ?: return true
+            val decoded = Base64.decode(payloadB64, Base64.URL_SAFE or Base64.NO_PADDING)
+            val json = JSONObject(String(decoded))
+            val exp = json.getLong("exp")
+            System.currentTimeMillis() / 1000 >= exp
+        } catch (_: Exception) { true }
+    }
+
     // ── 重置 ──────────────────────────────────────────────────
 
     /**
-     * 清除所有本地状态（角色 + UUID + token）。
-     * 适用于解绑 / 出厂重置场景；下次访问 [deviceUuid] 将重新生成。
+     * 清除所有本地状态（UUID、角色、token、同步时间戳）。
+     * 适用于完整重置场景；下次访问 [deviceUuid] 将重新生成。
      */
-    fun clear() = prefs.edit().clear().apply()
+    fun clear() {
+        prefs.edit().clear().apply()
+        metaPrefs.edit().clear().apply()
+    }
 
     // ── 常量 ──────────────────────────────────────────────────
 
     companion object {
-        private const val PREFS_NAME = "guardian_prefs"
-        private const val KEY_UUID   = "device_uuid"
-        private const val KEY_ROLE   = "device_role"
-        private const val KEY_TOKEN  = "auth_token"
+        private const val PREFS_NAME      = "guardian_secure_prefs"  // EncryptedSharedPreferences
+        private const val META_PREFS_NAME = "guardian_meta"           // 普通 SharedPreferences
+        private const val KEY_UUID        = "device_uuid"
+        private const val KEY_ROLE        = "device_role"
+        private const val KEY_TOKEN       = "auth_token"
+        private const val KEY_LAST_SYNC   = "last_sync_time"
     }
 }
